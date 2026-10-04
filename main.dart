@@ -431,7 +431,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (!await FlutterForegroundTask.isRunningService) {
         await FlutterForegroundTask.startService(
           serviceId: 7001,
-          serviceTypes: [ForegroundServiceTypes.specialUse],
           notificationTitle: 'SaFoDi sedang berjaga',
           notificationText: 'Memantau getaran meski layar mati',
           callback: startCallback,
