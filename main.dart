@@ -1,0 +1,78 @@
+# Simpan file ini di repo GitHub dengan path: .github/workflows/build.yml
+#
+# Isi repo cukup 3 file:
+#   main.dart
+#   AndroidManifest.xml
+#   .github/workflows/build.yml   (file ini)
+
+name: Build SaFoDi APK
+
+on:
+  workflow_dispatch:        # tombol "Run workflow" manual
+  push:
+    branches: [main]        # otomatis jalan tiap upload ke branch main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Buat project Flutter kosong
+        run: flutter create --platforms android --project-name safodi --org com.safodi app
+
+      - name: Salin kode SaFoDi
+        run: |
+          cp main.dart app/lib/main.dart
+          cp AndroidManifest.xml app/android/app/src/main/AndroidManifest.xml
+
+      - name: Tambah dependencies
+        working-directory: app
+        run: >
+          flutter pub add
+          http
+          sensors_plus:^6.1.1
+          audioplayers:^6.1.0
+          wakelock_plus
+          flutter_local_notifications:^18.0.1
+          flutter_foreground_task:^8.17.0
+
+      - name: Patch Gradle (desugaring + minSdk 23)
+        working-directory: app/android/app
+        run: |
+          python3 - <<'EOF'
+          import os, re
+          kts = os.path.exists('build.gradle.kts')
+          p = 'build.gradle.kts' if kts else 'build.gradle'
+          s = open(p).read()
+          if kts:
+              s = s.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+              s = re.sub(r'minSdk\s*=\s*flutter\.minSdkVersion', 'minSdk = 23', s)
+              s += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+          else:
+              s = s.replace('compileOptions {', 'compileOptions {\n        coreLibraryDesugaringEnabled true', 1)
+              s = re.sub(r'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 23', s)
+              s += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n}\n"
+          open(p, 'w').write(s)
+          print(open(p).read())
+          EOF
+
+      - name: Build APK
+        working-directory: app
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SaFoDi-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
