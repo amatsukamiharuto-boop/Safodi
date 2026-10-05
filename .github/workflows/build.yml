@@ -62,6 +62,51 @@ jobs:
           EOF
           tail -n 15 app/pubspec.yaml
 
+      - name: Patch Gradle root (compileSdk 36 untuk semua plugin)
+        working-directory: app/android
+        run: |
+          python3 - <<'EOF'
+          import os
+          kts_block = """subprojects {
+              afterEvaluate {
+                  val androidExt = extensions.findByName("android")
+                  if (androidExt != null) {
+                      val done = try {
+                          androidExt.javaClass.getMethod("setCompileSdk", Int::class.javaObjectType).invoke(androidExt, 36)
+                          true
+                      } catch (e: Exception) {
+                          false
+                      }
+                      if (!done) {
+                          try {
+                              androidExt.javaClass.getMethod("compileSdkVersion", Int::class.javaPrimitiveType).invoke(androidExt, 36)
+                          } catch (e: Exception) {
+                              println("compileSdk override gagal untuk $name: $e")
+                          }
+                      }
+                  }
+              }
+          }
+
+          """
+          groovy_block = """subprojects {
+              afterEvaluate { p ->
+                  if (p.hasProperty('android')) {
+                      p.android.compileSdkVersion(36)
+                  }
+              }
+          }
+
+          """
+          if os.path.exists('build.gradle.kts'):
+              path, block = 'build.gradle.kts', kts_block
+          else:
+              path, block = 'build.gradle', groovy_block
+          s = open(path).read()
+          open(path, 'w').write(block + s)
+          print(open(path).read())
+          EOF
+
       - name: Patch Gradle (desugaring + minSdk 23)
         working-directory: app/android/app
         run: |
