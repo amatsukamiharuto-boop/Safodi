@@ -46,6 +46,21 @@ jobs:
           wakelock_plus
           flutter_local_notifications:^18.0.1
           flutter_foreground_task:^8.17.0
+          shared_preferences
+          path_provider
+          file_picker:^8.1.2
+
+      - name: Pasang suara alarm (alarm.mp3)
+        run: |
+          mkdir -p app/assets
+          cp alarm.mp3 app/assets/alarm.mp3
+          python3 - <<'EOF'
+          p = 'app/pubspec.yaml'
+          s = open(p).read()
+          s = s.replace('uses-material-design: true', 'uses-material-design: true\n  assets:\n    - assets/alarm.mp3', 1)
+          open(p, 'w').write(s)
+          EOF
+          tail -n 15 app/pubspec.yaml
 
       - name: Patch Gradle (desugaring + minSdk 23)
         working-directory: app/android/app
