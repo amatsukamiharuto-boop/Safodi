@@ -148,26 +148,90 @@ String fmtDateTime(DateTime d) {
       '${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
 }
 
+class LevelStep {
+  const LevelStep(this.level, this.sec);
+  final int level; // 0 Rendah, 1 Sedang, 2 Tinggi
+  final double sec; // detik sejak alarm mulai
+}
+
 class VibrationEvent {
   VibrationEvent({
     required this.time,
     required this.peak,
     required this.threshold,
     this.durationSec = 0,
-  });
+    List<double>? samples,
+    this.spanMs = 0,
+    this.preMs = 0,
+  }) : samples = samples ?? <double>[];
 
   final DateTime time;
   double peak;
   final double threshold;
   int durationSec;
 
+  /// Sampel getaran (m/s²) untuk grafik, sudah diperkecil jumlahnya.
+  List<double> samples;
+
+  /// Rentang waktu seluruh sampel (ms) dan posisi awal alarm di dalamnya (ms).
+  double spanMs;
+  double preMs;
+
   int get level => vibrationLevel(peak);
+
+  /// Perubahan kategori selama kejadian, mis. Rendah -> Sedang -> Tinggi.
+  List<LevelStep> get timeline {
+    final n = samples.length;
+    if (n < 2 || spanMs <= 0) return [LevelStep(level, 0)];
+    final dt = spanMs / (n - 1);
+    final startIdx = (preMs / dt).round().clamp(0, n - 1).toInt();
+    final steps = <LevelStep>[];
+    var cur = -1;
+    var pending = -1;
+    var pendingCount = 0;
+    var pendingSec = 0.0;
+    for (var i = startIdx; i < n; i++) {
+      final lv = vibrationLevel(samples[i]);
+      final sec = (i - startIdx) * dt / 1000.0;
+      if (cur == -1) {
+        cur = lv;
+        steps.add(LevelStep(lv, 0));
+        continue;
+      }
+      if (lv == cur) {
+        pending = -1;
+        pendingCount = 0;
+        continue;
+      }
+      if (lv == pending) {
+        pendingCount++;
+      } else {
+        pending = lv;
+        pendingCount = 1;
+        pendingSec = sec;
+      }
+      // perubahan baru dianggap nyata kalau bertahan >= 2 sampel
+      if (pendingCount >= 2) {
+        cur = lv;
+        steps.add(LevelStep(lv, pendingSec));
+        pending = -1;
+        pendingCount = 0;
+      }
+    }
+    return steps.isEmpty ? [LevelStep(level, 0)] : steps;
+  }
+
+  String get progression =>
+      timeline.map((s) => levelLabel(s.level)).join(' → ');
 
   Map<String, dynamic> toJson() => {
         'time': time.toIso8601String(),
         'peak': peak,
         'threshold': threshold,
         'durationSec': durationSec,
+        'samples': samples,
+        'spanMs': spanMs,
+        'preMs': preMs,
       };
 
   factory VibrationEvent.fromJson(Map<String, dynamic> j) => VibrationEvent(
@@ -175,6 +239,12 @@ class VibrationEvent {
         peak: (j['peak'] as num?)?.toDouble() ?? 0,
         threshold: (j['threshold'] as num?)?.toDouble() ?? 12.5,
         durationSec: (j['durationSec'] as num?)?.toInt() ?? 0,
+        samples: (j['samples'] as List?)
+                ?.map((e) => (e as num).toDouble())
+                .toList() ??
+            <double>[],
+        spanMs: (j['spanMs'] as num?)?.toDouble() ?? 0,
+        preMs: (j['preMs'] as num?)?.toDouble() ?? 0,
       );
 }
 
@@ -332,6 +402,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   double _threshold = 12.5;
   double _current = 0;
   final List<double> _history = [];
+  final List<int> _historyMs = [];
+  final List<double> _recV = []; // rekaman getaran selama alarm
+  final List<int> _recMs = [];
+  double _recPreMs = 0;
   EarthquakeData? _quake;
   String? _quakeError;
   DateTime? _cooldownUntil;
@@ -453,8 +527,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _onAccel(AccelerometerEvent e) {
     final total = sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
     _history.add(total);
-    if (_history.length > _maxPoints) _history.removeAt(0);
+    _historyMs.add(nowMs);
+    if (_history.length > _maxPoints) {
+      _history.removeAt(0);
+      _historyMs.removeAt(0);
+    }
+    if (_alarmActive && _recV.length < 4000) {
+      _recV.add(total);
+      _recMs.add(nowMs);
+    }
     if (mounted) setState(() => _current = total);
 
     if (_alarmActive && total > _alarmPeak) {
@@ -482,6 +565,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       peak: peak,
       threshold: _threshold,
     );
+    // Mulai rekaman grafik; sertakan ~1 detik sebelum alarm agar kenaikannya terlihat.
+    _recV.clear();
+    _recMs.clear();
+    final seedN = min(_history.length, 20);
+    for (var i = _history.length - seedN; i < _history.length; i++) {
+      _recV.add(_history[i]);
+      _recMs.add(_historyMs[i]);
+    }
+    _recPreMs = _recMs.isEmpty ? 0 : (_recMs.last - _recMs.first).toDouble();
+    ev.preMs = _recPreMs;
     setState(() {
       _alarmActive = true;
       _alarmPeak = peak;
@@ -507,6 +600,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await Future.delayed(const Duration(seconds: 2));
     final p = max(ev.peak, _alarmPeak);
     ev.peak = p;
+    _syncEventSamples(ev);
     if (!_emergencyNotified) {
       if (vibrationLevel(p) == 2) _emergencyNotified = true;
       await showVibrationNotification(p, ev.time);
@@ -521,6 +615,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (ev != null) {
       ev.peak = max(ev.peak, _alarmPeak);
       ev.durationSec = DateTime.now().difference(ev.time).inSeconds;
+      _syncEventSamples(ev);
     }
     _currentEvent = null;
     if (mounted) setState(() => _alarmActive = false);
@@ -611,6 +706,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   // ------------------- Pengaturan, suara, riwayat -------------------------
+
+  /// Salin rekaman getaran ke kejadian (diperkecil maksimal 240 titik).
+  void _syncEventSamples(VibrationEvent ev) {
+    final n = _recV.length;
+    if (n == 0) return;
+    const maxPts = 240;
+    final k = (n / maxPts).ceil();
+    final out = <double>[];
+    for (var i = 0; i < n; i += k) {
+      var m = _recV[i];
+      for (var j = i + 1; j < min(i + k, n); j++) {
+        if (_recV[j] > m) m = _recV[j];
+      }
+      out.add((m * 10).round() / 10);
+    }
+    ev.samples = out;
+    ev.spanMs = (_recMs.last - _recMs.first).toDouble();
+    ev.preMs = _recPreMs;
+  }
 
   Future<void> _loadSettings() async {
     final p = await SharedPreferences.getInstance();
@@ -867,6 +981,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final color = level == 2
         ? Colors.redAccent
         : (level == 1 ? Colors.orangeAccent : Colors.amberAccent);
+    final steps = e.timeline;
+
+    final chips = <Widget>[];
+    for (var i = 0; i < steps.length; i++) {
+      if (i > 0) {
+        chips.add(const Icon(Icons.arrow_forward,
+            size: 16, color: Colors.white54));
+      }
+      chips.add(Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: levelColor(steps[i].level),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Text(
+          '${levelLabel(steps[i].level)} • ${steps[i].sec.toStringAsFixed(1)} dtk',
+          style: const TextStyle(
+              fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+        ),
+      ));
+    }
+
     return Card(
       child: ExpansionTile(
         leading: Icon(
@@ -874,7 +1010,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           color: color,
         ),
         title: Text('${levelLabel(level)} • ${e.peak.toStringAsFixed(2)} m/s²'),
-        subtitle: Text(fmtDateTime(e.time)),
+        subtitle: Text('${fmtDateTime(e.time)}\n${e.progression}'),
+        isThreeLine: true,
         childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
         expandedCrossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -882,6 +1019,45 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _row('Puncak', '${e.peak.toStringAsFixed(2)} m/s²'),
           _row('Threshold', '${e.threshold.toStringAsFixed(1)} m/s²'),
           _row('Alarm', '${e.durationSec} detik'),
+          const SizedBox(height: 8),
+          const Text('Perubahan kategori',
+              style: TextStyle(color: Colors.white70)),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: chips,
+          ),
+          const SizedBox(height: 12),
+          const Text('Grafik getaran', style: TextStyle(color: Colors.white70)),
+          const SizedBox(height: 6),
+          if (e.samples.length >= 2) ...[
+            Container(
+              width: double.infinity,
+              height: 140,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: CustomPaint(
+                painter: _SeriesPainter(
+                  e.samples,
+                  e.threshold,
+                  e.spanMs > 0 ? e.preMs / e.spanMs : 0,
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Oranye: batas deteksi • kuning: Sedang • merah: Tinggi • '
+              'garis putih tegak: awal alarm',
+              style: TextStyle(fontSize: 11, color: Colors.white54),
+            ),
+          ] else
+            const Text('Grafik tidak tersedia untuk kejadian ini.',
+                style: TextStyle(fontSize: 12, color: Colors.white54)),
         ],
       ),
     );
@@ -1264,6 +1440,32 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       'Batas deteksi ${_threshold.toStringAsFixed(1)} m/s² • $hms',
                       style: const TextStyle(color: Colors.white70)),
                   const SizedBox(height: 16),
+                  Container(
+                    width: double.infinity,
+                    height: 130,
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.black26,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: CustomPaint(
+                      painter: _ChartPainter(
+                        List<double>.from(_history),
+                        _threshold,
+                        _maxPoints,
+                        showLevels: true,
+                        lineColor: Colors.white,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Grafik getaran real-time • oranye: batas deteksi • '
+                    'kuning: Sedang • merah: Tinggi',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 11, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 12),
                   Row(children: [seg(0), seg(1), seg(2)]),
                   if (level == 2) ...[
                     const SizedBox(height: 16),
@@ -1322,11 +1524,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 // ---------------------------------------------------------------------------
 
 class _ChartPainter extends CustomPainter {
-  _ChartPainter(this.data, this.threshold, this.maxPoints);
+  _ChartPainter(this.data, this.threshold, this.maxPoints,
+      {this.showLevels = false, this.lineColor = Colors.cyanAccent});
 
   final List<double> data;
   final double threshold;
   final int maxPoints;
+  final bool showLevels;
+  final Color lineColor;
   static const double _maxY = 30;
 
   @override
@@ -1348,12 +1553,99 @@ class _ChartPainter extends CustomPainter {
     canvas.drawLine(
         Offset(0, yOf(threshold)), Offset(size.width, yOf(threshold)), th);
 
+    if (showLevels) {
+      final yMed = yOf(9.81 + kMediumDyn);
+      final yHigh = yOf(9.81 + kHighDyn);
+      canvas.drawLine(Offset(0, yMed), Offset(size.width, yMed),
+          Paint()
+            ..color = Colors.yellowAccent
+            ..strokeWidth = 1.2);
+      canvas.drawLine(Offset(0, yHigh), Offset(size.width, yHigh),
+          Paint()
+            ..color = Colors.redAccent
+            ..strokeWidth = 1.2);
+    }
+
     if (data.length < 2) return;
     final step = size.width / (maxPoints - 1);
     final offset = maxPoints - data.length;
     final path = Path();
     for (var i = 0; i < data.length; i++) {
       final x = (offset + i) * step;
+      final y = yOf(data[i]);
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = lineColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _ChartPainter old) => true;
+}
+
+// Grafik penuh satu kejadian di riwayat (dari awal sampai akhir rekaman).
+class _SeriesPainter extends CustomPainter {
+  _SeriesPainter(this.data, this.threshold, this.triggerFrac);
+
+  final List<double> data;
+  final double threshold;
+  final double triggerFrac; // posisi awal alarm, 0..1
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (data.length < 2) return;
+    var peak = 0.0;
+    for (final v in data) {
+      if (v > peak) peak = v;
+    }
+    final top = max(30.0, peak + 2);
+    double yOf(double v) =>
+        size.height - (min(max(v, 0.0), top) / top) * size.height;
+
+    final grid = Paint()
+      ..color = Colors.white12
+      ..strokeWidth = 1;
+    for (var i = 0; i <= 3; i++) {
+      final y = size.height * i / 3;
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
+    }
+
+    void hLine(double value, Color c, double w) {
+      canvas.drawLine(
+        Offset(0, yOf(value)),
+        Offset(size.width, yOf(value)),
+        Paint()
+          ..color = c
+          ..strokeWidth = w,
+      );
+    }
+
+    hLine(threshold, Colors.orangeAccent, 1.5);
+    hLine(9.81 + kMediumDyn, Colors.yellowAccent, 1.2);
+    hLine(9.81 + kHighDyn, Colors.redAccent, 1.2);
+
+    final tx = min(max(triggerFrac, 0.0), 1.0) * size.width;
+    canvas.drawLine(
+      Offset(tx, 0),
+      Offset(tx, size.height),
+      Paint()
+        ..color = Colors.white54
+        ..strokeWidth = 1,
+    );
+
+    final path = Path();
+    final step = size.width / (data.length - 1);
+    for (var i = 0; i < data.length; i++) {
+      final x = i * step;
       final y = yOf(data[i]);
       if (i == 0) {
         path.moveTo(x, y);
@@ -1371,5 +1663,5 @@ class _ChartPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _ChartPainter old) => true;
+  bool shouldRepaint(covariant _SeriesPainter old) => true;
 }
