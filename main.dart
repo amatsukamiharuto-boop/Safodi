@@ -1011,7 +1011,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
         title: Text('${levelLabel(level)} • ${e.peak.toStringAsFixed(2)} m/s²'),
         subtitle: Text('${fmtDateTime(e.time)}\n${e.progression}'),
-        isThreeLine: true,
         childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
         expandedCrossAxisAlignment: CrossAxisAlignment.start,
         children: [
